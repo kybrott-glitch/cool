@@ -187,6 +187,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await status_msg.edit_text("❌ The source sticker set appears to be empty.")
         return
 
+    # Determine sticker format from the first sticker's file type
+    first = all_stickers[0]
+    if first.is_animated:
+        fmt = "animated"
+    elif first.is_video:
+        fmt = "video"
+    else:
+        fmt = "static"
+
     # ── 5. Download all sticker files ────────────────────────────────────────
     tmp_dir = f"/tmp/stickerpack_{int(time.time())}"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -223,7 +232,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         async with aiofiles.open(path, "rb") as fh:
             data = await fh.read()
         input_stickers.append(
-            InputSticker(sticker=data, emoji_list=emojis[:1])
+            InputSticker(sticker=data, emoji_list=emojis[:1], format=fmt)
         )
 
     # create_new_sticker_set requires user_id of the owner (must have started the bot)
