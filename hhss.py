@@ -40,7 +40,6 @@ try:
         InputSticker,
         Bot,
     )
-    from telegram.constants import StickerFormat
     from telegram.ext import (
         Application,
         CommandHandler,
@@ -188,18 +187,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await status_msg.edit_text("❌ The source sticker set appears to be empty.")
         return
 
-    sticker_format = source_set.sticker_type   # "regular" | "mask" | "custom_emoji"
-    # Determine file format from the first sticker
-    first = all_stickers[0]
-    is_video   = first.is_video
-    is_animated = first.is_animated
-    if is_animated:
-        fmt = StickerFormat.ANIMATED   # .tgs
-    elif is_video:
-        fmt = StickerFormat.VIDEO      # .webm
-    else:
-        fmt = StickerFormat.STATIC     # .webp
-
     # ── 5. Download all sticker files ────────────────────────────────────────
     tmp_dir = f"/tmp/stickerpack_{int(time.time())}"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -236,7 +223,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         async with aiofiles.open(path, "rb") as fh:
             data = await fh.read()
         input_stickers.append(
-            InputSticker(sticker=data, emoji_list=emojis[:1], format=fmt)
+            InputSticker(sticker=data, emoji_list=emojis[:1])
         )
 
     # create_new_sticker_set requires user_id of the owner (must have started the bot)
@@ -248,7 +235,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             name=pack_short,
             title=pack_title,
             stickers=input_stickers[:50],  # Telegram max = 50 per creation call
-            sticker_format=fmt,
         )
     except Exception as exc:
         err = str(exc)
