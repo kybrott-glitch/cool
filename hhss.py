@@ -31,7 +31,7 @@ from typing import Optional
 #  ⚙️  CONFIGURATION  – fill these in
 # ──────────────────────────────────────────────
 BOT_TOKEN: str = "8651176548:AAF0nHOk0HYSFcvkgToocRfVviPIRsaSXzE"      # from @BotFather
-OWNER_ID:  int = 1899208318                      # your Telegram user ID (int)
+OWNER_ID:  int = 1899208318                           # your Telegram user ID (int)
 # ──────────────────────────────────────────────
 
 try:
@@ -65,6 +65,18 @@ logging.basicConfig(
 logger = logging.getLogger("EmojiStickerBot")
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+async def _safe_edit(msg, text: str, **kwargs) -> None:
+    """Edit a message; silently swallow flood-wait / not-modified errors."""
+    try:
+        await msg.edit_text(text, **kwargs)
+    except Exception as exc:
+        err = str(exc).lower()
+        if "not modified" in err or "too many requests" in err or "flood" in err:
+            logger.debug("edit_text suppressed: %s", exc)
+        else:
+            logger.warning("edit_text failed: %s", exc)
+
 
 def _safe_name(text: str) -> str:
     """Turn arbitrary text into a valid sticker-set short name segment."""
@@ -157,35 +169,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         stickers = await bot.get_custom_emoji_stickers([custom_emoji_id])
     except Exception as exc:
-        await status_msg.edit_text(f"❌ Could not fetch emoji info: {exc}")
+        await _safe_edit(status_msg, f"❌ Could not fetch emoji info: {exc}")
         return
 
     if not stickers:
-        await status_msg.edit_text("❌ Could not retrieve sticker data for that emoji.")
+        await _safe_edit(status_msg, "❌ Could not retrieve sticker data for that emoji.")
         return
 
     source_sticker     = stickers[0]
     source_set_name: Optional[str] = source_sticker.set_name
 
     if not source_set_name:
-        await status_msg.edit_text(
+        await _safe_edit(status_msg,
             "❌ This emoji doesn't belong to a named sticker set "
             "(it may be a standalone premium emoji)."
         )
         return
 
-    await status_msg.edit_text(f"📦 Found pack `{source_set_name}`. Downloading stickers…", parse_mode="Markdown")
+    await _safe_edit(status_msg, f"📦 Found pack `{source_set_name}`. Downloading stickers…", parse_mode="Markdown")
 
     # ── 4. Fetch all stickers in the source pack ─────────────────────────────
     try:
         source_set = await bot.get_sticker_set(source_set_name)
     except Exception as exc:
-        await status_msg.edit_text(f"❌ Failed to load sticker set: {exc}")
+        await _safe_edit(status_msg, f"❌ Failed to load sticker set: {exc}")
         return
 
     all_stickers = source_set.stickers
     if not all_stickers:
-        await status_msg.edit_text("❌ The source sticker set appears to be empty.")
+        await _safe_edit(status_msg, "❌ The source sticker set appears to be empty.")
         return
 
     # Determine sticker format from the first sticker's file type
@@ -212,16 +224,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             emojis = [stk.emoji] if stk.emoji else ["🌟"]
             downloaded.append((dest, emojis))
         if idx % 10 == 0 or idx == total:
-            await status_msg.edit_text(
-                f"⬇️ Downloading {idx}/{total} stickers…"
-            )
+            await _safe_edit(status_msg, f"⬇️ Downloading {idx}/{total} stickers…")
 
     if not downloaded:
-        await status_msg.edit_text("❌ No stickers could be downloaded.")
+        await _safe_edit(status_msg, "❌ No stickers could be downloaded.")
         return
 
     # ── 6. Build the new sticker pack ────────────────────────────────────────
-    await status_msg.edit_text("🛠️ Creating your sticker pack…")
+    await _safe_edit(status_msg, "🛠️ Creating your sticker pack…")
 
     bot_me       = await bot.get_me()
     bot_username = bot_me.username
@@ -264,7 +274,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 logger.warning("Create attempt %d failed: %s — retrying…", attempt + 1, err)
                 await asyncio.sleep(3)
             else:
-                await status_msg.edit_text(
+                await _safe_edit(status_msg,
                     f"❌ Failed to create sticker pack:\n`{err}`",
                     parse_mode="Markdown",
                 )
@@ -306,7 +316,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Update progress every 5 stickers or every 10 seconds
         now = time.time()
         if idx % 5 == 0 or (now - last_edit_time) > 10:
-            await status_msg.edit_text(
+            await _safe_edit(status_msg,
                 f"➕ Adding stickers… {added}/{total_stickers}"
                 + (f"  ({failed} failed)" if failed else "")
             )
@@ -327,7 +337,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── 8. Reply with success ─────────────────────────────────────────────────
     pack_link = f"https://t.me/addstickers/{pack_short}"
-    await status_msg.edit_text(
+    await _safe_edit(status_msg,
         f"✅ *Sticker pack created!*\n\n"
         f"📛 *Title:* {pack_title}\n"
         f"🔗 *Link:* {pack_link}\n"
