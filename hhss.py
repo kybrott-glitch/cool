@@ -1,389 +1,281 @@
-#!/usr/bin/env python3
-"""
-Telegram Bot: Premium Emoji → Animated Sticker Pack Converter
-============================================================
-Send any custom premium emoji to this bot and it will:
-1. Detect the emoji's custom_emoji_id
-2. Fetch all stickers in the same emoji pack
-3. Create a new animated sticker pack (TGS format) under your bot
-4. Reply with the pack name, link, and a summary
-
-Requirements:
-    pip install python-telegram-bot==20.* aiofiles aiohttp
-
-Usage:
-    1. Create a bot via @BotFather → get BOT_TOKEN
-    2. Start the bot once yourself and send /start → get your OWNER_ID
-       (or check via @userinfobot)
-    3. Fill in BOT_TOKEN and OWNER_ID below, then run:
-           python emoji_to_sticker_bot.py
-"""
-
-import asyncio
-import logging
 import os
-import re
-import sys
-import time
-from typing import Optional
+import json
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from dotenv import load_dotenv
+import logging
 
-# ──────────────────────────────────────────────
-#  ⚙️  CONFIGURATION  – fill these in
-# ──────────────────────────────────────────────
-BOT_TOKEN: str = "8651176548:AAF0nHOk0HYSFcvkgToocRfVviPIRsaSXzE"      # from @BotFather
-OWNER_ID:  int = 1899208318                           # your Telegram user ID (int)
-# ──────────────────────────────────────────────
+# Load environment variables
+load_dotenv()
 
-try:
-    from telegram import (
-        Update,
-        InputSticker,
-        Bot,
-    )
-    from telegram.ext import (
-        Application,
-        CommandHandler,
-        MessageHandler,
-        ContextTypes,
-        filters,
-    )
-    from telegram.request import HTTPXRequest
-    import aiohttp
-    import aiofiles
-except ImportError:
-    print(
-        "\n[ERROR] Missing dependencies.\n"
-        "Install them with:\n\n"
-        "    pip install 'python-telegram-bot[job-queue]>=20.0' aiofiles aiohttp\n"
-    )
-    sys.exit(1)
-
+# Enable logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-logger = logging.getLogger("EmojiStickerBot")
+logger = logging.getLogger(__name__)
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# Configuration
+BOT_TOKEN = "8651176548:AAF0nHOk0HYSFcvkgToocRfVviPIRsaSXzE"
+BOT_USERNAME = nft12bot
 
-async def _safe_edit(msg, text: str, **kwargs) -> None:
-    """Edit a message; silently swallow flood-wait / not-modified errors."""
-    try:
-        await msg.edit_text(text, **kwargs)
-    except Exception as exc:
-        err = str(exc).lower()
-        if "not modified" in err or "too many requests" in err or "flood" in err:
-            logger.debug("edit_text suppressed: %s", exc)
+class EmojiStickerBot:
+    def __init__(self):
+        self.user_sessions = {}  # Store user sessions {user_id: {'emoji_set': {}, 'step': str}}
+        
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send a welcome message when /start is issued."""
+        user = update.effective_user
+        welcome_text = f"""
+🎨 *Emoji to Sticker Pack Converter Bot*
+
+Hi {user.first_name}! I can help you clone premium custom emojis and convert them into sticker packs.
+
+*How to use:*
+1️⃣ Send me a premium custom emoji
+2️⃣ I'll analyze the emoji pack
+3️⃣ Provide your custom sticker pack name
+4️⃣ Get your converted sticker pack link!
+
+*Commands:*
+/start - Show this message
+/help - Show help information
+/cancel - Cancel current operation
+
+*Note:* The bot needs to be added to your group with premium emoji access to see the emoji details.
+
+Let's get started! Send me a premium custom emoji. 🚀
+"""
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    
+    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send help message."""
+        help_text = """
+🤖 *Bot Help*
+
+*What this bot does:*
+- Clones premium custom emoji packs
+- Converts them to standard sticker packs
+- Gives you a shareable link
+
+*Steps to use:*
+1. Send a premium custom emoji (from any Telegram premium pack)
+2. Reply with your desired sticker pack name
+3. Wait while I convert the pack
+4. Receive your sticker pack link!
+
+*Commands:*
+/start - Start the bot
+/help - Show this help
+/cancel - Cancel operation
+
+*Requirements:*
+- The bot must be in the same chat where the premium emoji is sent
+- You need to have Telegram Premium to access premium emojis
+
+*Note:* The emoji pack will be cloned and converted to a sticker pack. Your new pack will contain all emojis from the original pack converted to stickers.
+"""
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel current operation."""
+        user_id = update.effective_user.id
+        if user_id in self.user_sessions:
+            del self.user_sessions[user_id]
+            await update.message.reply_text("✅ Operation cancelled. Send me a new premium emoji to start over!")
         else:
-            logger.warning("edit_text failed: %s", exc)
-
-
-def _safe_name(text: str) -> str:
-    """Turn arbitrary text into a valid sticker-set short name segment."""
-    return re.sub(r"[^a-zA-Z0-9_]", "_", text)[:32].strip("_") or "pack"
-
-
-async def _download_file(bot: Bot, file_id: str, dest: str) -> bool:
-    """Download a Telegram file to *dest*.  Returns True on success."""
-    try:
-        tg_file = await bot.get_file(file_id)
-        await tg_file.download_to_drive(dest)
-        return True
-    except Exception as exc:
-        logger.warning("Download failed for %s: %s", file_id, exc)
-        return False
-
-
-async def _make_pack_name(bot_username: str, seed: str) -> str:
-    """Build a unique sticker-set short name (≤ 64 chars, ends with _by_<bot>)."""
-    ts   = str(int(time.time()))[-6:]          # last 6 digits of epoch
-    slug = _safe_name(seed)[:20]
-    return f"{slug}_{ts}_by_{bot_username}"
-
-
-# ── /start ───────────────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "👋 *Premium Emoji → Sticker Pack Bot*\n\n"
-        "Send me any message that contains a *custom premium emoji* "
-        "and I'll convert its entire emoji pack into a Telegram "
-        "animated sticker pack for you!\n\n"
-        "You can also prefix your message with a custom pack name, e.g.:\n"
-        "`My Cool Pack <emoji>`",
-        parse_mode="Markdown",
-    )
-
-
-# ── /help ─────────────────────────────────────────────────────────────────────
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "*How to use:*\n"
-        "1. Send a message containing a custom premium Telegram emoji.\n"
-        "2. Optionally add text before the emoji as the pack title.\n"
-        "3. The bot fetches every emoji in that pack and creates a sticker set.\n"
-        "4. You receive a direct link to your new sticker pack.\n\n"
-        "*Notes:*\n"
-        "• Only animated (TGS / video) custom emoji packs are supported.\n"
-        "• Sticker sets are created under the *bot's* account – you can "
-        "  add them to your favourites from the link.",
-        parse_mode="Markdown",
-    )
-
-
-# ── main message handler ──────────────────────────────────────────────────────
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message:
-        return
-
-    # ── 1. Find the first custom_emoji entity ────────────────────────────────
-    entities = message.entities or []
-    custom_emoji_id: Optional[str] = None
-    for ent in entities:
-        if ent.type == "custom_emoji":
-            custom_emoji_id = ent.custom_emoji_id
-            break
-
-    if not custom_emoji_id:
-        await message.reply_text(
-            "⚠️ No custom premium emoji found in your message.\n"
-            "Please send a message that *contains* a custom emoji.",
-            parse_mode="Markdown",
-        )
-        return
-
-    # ── 2. Derive a pack title from the message text (before the emoji) ──────
-    plain_text = (message.text or "").strip()
-    # Remove all custom-emoji characters to get the human-typed title
-    title_candidate = re.sub(r"[\U00010000-\U0010ffff]", "", plain_text).strip()
-    pack_title = title_candidate[:50] if title_candidate else "My Emoji Pack"
-
-    status_msg = await message.reply_text("🔍 Fetching emoji info…")
-
-    bot: Bot = context.bot
-
-    # ── 3. Get the sticker set that owns this custom emoji ───────────────────
-    try:
-        stickers = await bot.get_custom_emoji_stickers([custom_emoji_id])
-    except Exception as exc:
-        await _safe_edit(status_msg, f"❌ Could not fetch emoji info: {exc}")
-        return
-
-    if not stickers:
-        await _safe_edit(status_msg, "❌ Could not retrieve sticker data for that emoji.")
-        return
-
-    source_sticker     = stickers[0]
-    source_set_name: Optional[str] = source_sticker.set_name
-
-    if not source_set_name:
-        await _safe_edit(status_msg,
-            "❌ This emoji doesn't belong to a named sticker set "
-            "(it may be a standalone premium emoji)."
-        )
-        return
-
-    await _safe_edit(status_msg, f"📦 Found pack `{source_set_name}`. Downloading stickers…", parse_mode="Markdown")
-
-    # ── 4. Fetch all stickers in the source pack ─────────────────────────────
-    try:
-        source_set = await bot.get_sticker_set(source_set_name)
-    except Exception as exc:
-        await _safe_edit(status_msg, f"❌ Failed to load sticker set: {exc}")
-        return
-
-    all_stickers = source_set.stickers
-    if not all_stickers:
-        await _safe_edit(status_msg, "❌ The source sticker set appears to be empty.")
-        return
-
-    # Determine sticker format from the first sticker's file type
-    first = all_stickers[0]
-    if first.is_animated:
-        fmt = "animated"
-    elif first.is_video:
-        fmt = "video"
-    else:
-        fmt = "static"
-
-    # ── 5. Download all sticker files ────────────────────────────────────────
-    tmp_dir = f"/tmp/stickerpack_{int(time.time())}"
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    downloaded: list[tuple[str, list[str]]] = []   # (local_path, [emoji])
-    total = len(all_stickers)
-
-    for idx, stk in enumerate(all_stickers, 1):
-        ext = ".tgs" if stk.is_animated else (".webm" if stk.is_video else ".webp")
-        dest = os.path.join(tmp_dir, f"sticker_{idx:03d}{ext}")
-        ok   = await _download_file(bot, stk.file_id, dest)
-        if ok:
-            emojis = [stk.emoji] if stk.emoji else ["🌟"]
-            downloaded.append((dest, emojis))
-        if idx % 10 == 0 or idx == total:
-            await _safe_edit(status_msg, f"⬇️ Downloading {idx}/{total} stickers…")
-
-    if not downloaded:
-        await _safe_edit(status_msg, "❌ No stickers could be downloaded.")
-        return
-
-    # ── 6. Build the new sticker pack ────────────────────────────────────────
-    await _safe_edit(status_msg, "🛠️ Creating your sticker pack…")
-
-    bot_me       = await bot.get_me()
-    bot_username = bot_me.username
-    pack_short   = await _make_pack_name(bot_username, pack_title)
-
-    user_id = update.effective_user.id
-
-    # Read all files into memory first
-    input_stickers = []
-    for path, emojis in downloaded:
-        async with aiofiles.open(path, "rb") as fh:
-            data = await fh.read()
-        input_stickers.append(
-            InputSticker(sticker=data, emoji_list=emojis[:1], format=fmt)
-        )
-
-    total_stickers = len(input_stickers)
-
-    # ── Create the pack with only the FIRST sticker (avoids upload timeout) ──
-    created = False
-    for attempt in range(3):
+            await update.message.reply_text("No active operation to cancel.")
+    
+    async def handle_emoji(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle premium custom emoji messages."""
+        user_id = update.effective_user.id
+        message = update.message
+        
+        # Check if message contains a custom emoji
+        if not message.entities:
+            await message.reply_text("❌ Please send a premium custom emoji (from Telegram's premium emoji pack).")
+            return
+        
+        # Look for custom_emoji entities
+        emoji_data = None
+        for entity in message.entities:
+            if entity.type == "custom_emoji":
+                emoji_data = {
+                    'emoji_id': entity.custom_emoji_id,
+                    'document_id': None
+                }
+                break
+        
+        if not emoji_data:
+            await message.reply_text("❌ That doesn't look like a premium custom emoji. Please send a premium emoji from Telegram's emoji packs.")
+            return
+        
+        # Try to get the emoji file
         try:
-            await bot.create_new_sticker_set(
+            # Get the custom emoji sticker
+            custom_emoji = await context.bot.get_custom_emoji_stickers([emoji_data['emoji_id']])
+            if custom_emoji:
+                emoji_data['sticker'] = custom_emoji[0]
+                emoji_data['set_name'] = custom_emoji[0].set_name
+                emoji_data['emoji'] = custom_emoji[0].emoji
+                
+                # Get the sticker set information
+                sticker_set = await context.bot.get_sticker_set(custom_emoji[0].set_name)
+                emoji_data['sticker_set'] = sticker_set
+                
+                # Store session
+                self.user_sessions[user_id] = {
+                    'step': 'awaiting_pack_name',
+                    'original_set': sticker_set,
+                    'emoji_data': emoji_data
+                }
+                
+                # Show pack info and ask for name
+                pack_info = f"""
+📦 *Emoji Pack Detected!*
+
+*Pack Name:* `{sticker_set.name}`
+*Title:* {sticker_set.title}
+*Emojis in pack:* {len(sticker_set.stickers)}
+
+Now, please send me your desired sticker pack name.
+*Requirements:*
+- Only English letters, numbers, and underscores
+- Must start with a letter
+- Cannot contain spaces
+- Between 3-64 characters
+
+Example: `my_cool_stickers_by_{BOT_USERNAME}`
+
+Send /cancel to abort.
+"""
+                await message.reply_text(pack_info, parse_mode='Markdown')
+                
+        except Exception as e:
+            logger.error(f"Error getting emoji pack: {e}")
+            await message.reply_text("❌ Failed to analyze the emoji pack. Make sure the bot has access to the emoji and try again.")
+    
+    async def handle_pack_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle the sticker pack name input."""
+        user_id = update.effective_user.id
+        message = update.message
+        
+        if user_id not in self.user_sessions:
+            await message.reply_text("Please send a premium custom emoji first using /start.")
+            return
+        
+        session = self.user_sessions[user_id]
+        if session.get('step') != 'awaiting_pack_name':
+            await message.reply_text("Please send a premium custom emoji first.")
+            return
+        
+        pack_name = message.text.strip()
+        
+        # Validate pack name
+        import re
+        pattern = r'^[a-zA-Z][a-zA-Z0-9_]{2,63}$'
+        if not re.match(pattern, pack_name):
+            await message.reply_text("❌ Invalid pack name!\n\nRequirements:\n- Start with a letter\n- Only letters, numbers, underscores\n- 3-64 characters long\n\nTry again or send /cancel")
+            return
+        
+        # Add bot username to avoid conflicts
+        full_pack_name = f"{pack_name}_by_{BOT_USERNAME}"
+        
+        # Send processing message
+        processing_msg = await message.reply_text("🔄 Cloning emoji pack and converting to stickers... This may take a few moments.")
+        
+        try:
+            # Create new sticker pack
+            original_set = session['original_set']
+            stickers = original_set.stickers
+            
+            # Prepare sticker files for upload
+            sticker_files = []
+            for i, sticker in enumerate(stickers):
+                # Download the sticker file
+                file = await context.bot.get_file(sticker.file_id)
+                file_path = f"temp_sticker_{i}.webp"
+                await file.download_to_drive(file_path)
+                sticker_files.append(file_path)
+            
+            # Create the sticker pack
+            await context.bot.create_new_sticker_set(
                 user_id=user_id,
-                name=pack_short,
-                title=pack_title,
-                stickers=[input_stickers[0]],
-                read_timeout=60,
-                write_timeout=60,
-                connect_timeout=60,
+                name=full_pack_name,
+                title=f"{original_set.title} (Converted)",
+                stickers=sticker_files,
+                sticker_format="static"
             )
-            created = True
-            break
-        except Exception as exc:
-            err = str(exc)
-            if "name is already occupied" in err.lower() or "STICKERSET_INVALID" in err:
-                created = True   # pack already exists, continue adding
-                break
-            if attempt < 2:
-                logger.warning("Create attempt %d failed: %s — retrying…", attempt + 1, err)
-                await asyncio.sleep(3)
-            else:
-                await _safe_edit(status_msg,
-                    f"❌ Failed to create sticker pack:\n`{err}`",
-                    parse_mode="Markdown",
-                )
-                return
+            
+            # Send success message with link
+            pack_link = f"https://t.me/addstickers/{full_pack_name}"
+            success_msg = f"""
+✅ *Success! Sticker Pack Created!*
 
-    if not created:
+🎉 Your sticker pack has been created successfully!
+
+*Pack Name:* `{full_pack_name}`
+*Number of stickers:* {len(stickers)}
+
+🔗 *Click to add stickers:* [Add Sticker Pack]({pack_link})
+
+💡 *Tip:* Share this link with friends to share the stickers!
+
+Use /start to convert another emoji pack.
+"""
+            await processing_msg.edit_text(success_msg, parse_mode='Markdown', disable_web_page_preview=True)
+            
+            # Clean up temp files
+            for file_path in sticker_files:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            
+            # Clear session
+            del self.user_sessions[user_id]
+            
+        except Exception as e:
+            logger.error(f"Error creating sticker pack: {e}")
+            error_msg = f"❌ Failed to create sticker pack: {str(e)}\n\nPossible reasons:\n- Pack name already exists\n- Invalid pack name format\n- Too many stickers in pack\n\nTry a different name or contact @{BOT_USERNAME} for help."
+            await processing_msg.edit_text(error_msg)
+            
+            # Clean up temp files if any
+            for file_path in sticker_files if 'sticker_files' in locals() else []:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle regular text messages."""
+        user_id = update.effective_user.id
+        
+        if user_id in self.user_sessions and self.user_sessions[user_id].get('step') == 'awaiting_pack_name':
+            await self.handle_pack_name(update, context)
+        else:
+            await update.message.reply_text("Please send a premium custom emoji to get started, or use /help for assistance.")
+
+def main():
+    """Start the bot."""
+    if not BOT_TOKEN:
+        logger.error("No BOT_TOKEN found in environment variables!")
+        print("Please set BOT_TOKEN in .env file")
         return
+    
+    # Create bot instance
+    bot = EmojiStickerBot()
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CommandHandler("help", bot.help))
+    application.add_handler(CommandHandler("cancel", bot.cancel))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.STICKER, bot.handle_emoji))
+    
+    # Start bot
+    print("🤖 Bot is starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    # ── Add remaining stickers one by one with progress updates ──────────────
-    added   = 1   # first sticker already in pack
-    failed  = 0
-    last_edit_time = time.time()
-
-    for idx, stk in enumerate(input_stickers[1:], start=2):
-        for attempt in range(3):
-            try:
-                await bot.add_sticker_to_set(
-                    user_id=user_id,
-                    name=pack_short,
-                    sticker=stk,
-                    read_timeout=60,
-                    write_timeout=60,
-                    connect_timeout=60,
-                )
-                added += 1
-                break
-            except Exception as exc:
-                err = str(exc)
-                if "STICKERSET_FULL" in err:
-                    logger.info("Pack is full at %d stickers.", added)
-                    idx = total_stickers  # force exit outer loop
-                    break
-                if attempt < 2:
-                    await asyncio.sleep(2)
-                else:
-                    logger.warning("Skipping sticker %d: %s", idx, exc)
-                    failed += 1
-
-        # Update progress every 5 stickers or every 10 seconds
-        now = time.time()
-        if idx % 5 == 0 or (now - last_edit_time) > 10:
-            await _safe_edit(status_msg,
-                f"➕ Adding stickers… {added}/{total_stickers}"
-                + (f"  ({failed} failed)" if failed else "")
-            )
-            last_edit_time = now
-
-        await asyncio.sleep(0.4)   # stay well under Telegram rate limits
-
-    # ── 7. Clean up temp files ────────────────────────────────────────────────
-    for path, _ in downloaded:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-    try:
-        os.rmdir(tmp_dir)
-    except OSError:
-        pass
-
-    # ── 8. Reply with success ─────────────────────────────────────────────────
-    pack_link = f"https://t.me/addstickers/{pack_short}"
-    await _safe_edit(status_msg,
-        f"✅ *Sticker pack created!*\n\n"
-        f"📛 *Title:* {pack_title}\n"
-        f"🔗 *Link:* {pack_link}\n"
-        f"🎨 *Stickers:* {added}/{total_stickers} added\n"
-        f"📁 *Source pack:* `{source_set_name}`\n\n"
-        f"Tap the link to add the pack to Telegram!",
-        parse_mode="Markdown",
-    )
-
-
-# ── entry point ───────────────────────────────────────────────────────────────
-
-def main() -> None:
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or OWNER_ID == 0:
-        print(
-            "\n[SETUP REQUIRED]\n"
-            "Open this script and fill in:\n"
-            "  BOT_TOKEN  – your bot token from @BotFather\n"
-            "  OWNER_ID   – your Telegram numeric user ID\n"
-        )
-        sys.exit(1)
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(HTTPXRequest(
-            read_timeout=60,
-            write_timeout=60,
-            connect_timeout=60,
-            pool_timeout=60,
-        ))
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message,
-        )
-    )
-
-    logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
