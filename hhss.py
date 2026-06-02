@@ -31,7 +31,7 @@ from typing import Optional
 #  ⚙️  CONFIGURATION  – fill these in
 # ──────────────────────────────────────────────
 BOT_TOKEN: str = "8651176548:AAF0nHOk0HYSFcvkgToocRfVviPIRsaSXzE"      # from @BotFather
-OWNER_ID:  int = 1899208318                           # your Telegram user ID (int)
+OWNER_ID:  int = 1899208318                      # your Telegram user ID (int)
 # ──────────────────────────────────────────────
 
 try:
@@ -47,6 +47,7 @@ try:
         ContextTypes,
         filters,
     )
+    from telegram.request import HTTPXRequest
     import aiohttp
     import aiofiles
 except ImportError:
@@ -226,7 +227,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     bot_username = bot_me.username
     pack_short   = await _make_pack_name(bot_username, pack_title)
 
-    # Prepare InputSticker list
+    user_id = update.effective_user.id
+
+    # Read all files into memory first
     input_stickers = []
     for path, emojis in downloaded:
         async with aiofiles.open(path, "rb") as fh:
@@ -235,37 +238,81 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             InputSticker(sticker=data, emoji_list=emojis[:1], format=fmt)
         )
 
-    # create_new_sticker_set requires user_id of the owner (must have started the bot)
-    user_id = update.effective_user.id
+    total_stickers = len(input_stickers)
 
-    try:
-        await bot.create_new_sticker_set(
-            user_id=user_id,
-            name=pack_short,
-            title=pack_title,
-            stickers=input_stickers[:50],  # Telegram max = 50 per creation call
-        )
-    except Exception as exc:
-        err = str(exc)
-        if "STICKERSET_INVALID" in err or "name is already occupied" in err.lower():
-            # Append more stickers to an existing pack if name clash
-            logger.info("Pack exists, will try adding stickers: %s", err)
-        else:
-            await status_msg.edit_text(f"❌ Failed to create sticker pack:\n`{err}`", parse_mode="Markdown")
-            return
+    # ── Create the pack with only the FIRST sticker (avoids upload timeout) ──
+    created = False
+    for attempt in range(3):
+        try:
+            await bot.create_new_sticker_set(
+                user_id=user_id,
+                name=pack_short,
+                title=pack_title,
+                stickers=[input_stickers[0]],
+                read_timeout=60,
+                write_timeout=60,
+                connect_timeout=60,
+            )
+            created = True
+            break
+        except Exception as exc:
+            err = str(exc)
+            if "name is already occupied" in err.lower() or "STICKERSET_INVALID" in err:
+                created = True   # pack already exists, continue adding
+                break
+            if attempt < 2:
+                logger.warning("Create attempt %d failed: %s — retrying…", attempt + 1, err)
+                await asyncio.sleep(3)
+            else:
+                await status_msg.edit_text(
+                    f"❌ Failed to create sticker pack:\n`{err}`",
+                    parse_mode="Markdown",
+                )
+                return
 
-    # Add remaining stickers (51–200) in batches
-    if len(input_stickers) > 50:
-        await status_msg.edit_text("➕ Adding remaining stickers…")
-        for stk in input_stickers[50:]:
+    if not created:
+        return
+
+    # ── Add remaining stickers one by one with progress updates ──────────────
+    added   = 1   # first sticker already in pack
+    failed  = 0
+    last_edit_time = time.time()
+
+    for idx, stk in enumerate(input_stickers[1:], start=2):
+        for attempt in range(3):
             try:
                 await bot.add_sticker_to_set(
                     user_id=user_id,
                     name=pack_short,
                     sticker=stk,
+                    read_timeout=60,
+                    write_timeout=60,
+                    connect_timeout=60,
                 )
+                added += 1
+                break
             except Exception as exc:
-                logger.warning("Could not add sticker: %s", exc)
+                err = str(exc)
+                if "STICKERSET_FULL" in err:
+                    logger.info("Pack is full at %d stickers.", added)
+                    idx = total_stickers  # force exit outer loop
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                else:
+                    logger.warning("Skipping sticker %d: %s", idx, exc)
+                    failed += 1
+
+        # Update progress every 5 stickers or every 10 seconds
+        now = time.time()
+        if idx % 5 == 0 or (now - last_edit_time) > 10:
+            await status_msg.edit_text(
+                f"➕ Adding stickers… {added}/{total_stickers}"
+                + (f"  ({failed} failed)" if failed else "")
+            )
+            last_edit_time = now
+
+        await asyncio.sleep(0.4)   # stay well under Telegram rate limits
 
     # ── 7. Clean up temp files ────────────────────────────────────────────────
     for path, _ in downloaded:
@@ -284,7 +331,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"✅ *Sticker pack created!*\n\n"
         f"📛 *Title:* {pack_title}\n"
         f"🔗 *Link:* {pack_link}\n"
-        f"🎨 *Stickers:* {len(downloaded)} converted\n"
+        f"🎨 *Stickers:* {added}/{total_stickers} added\n"
         f"📁 *Source pack:* `{source_set_name}`\n\n"
         f"Tap the link to add the pack to Telegram!",
         parse_mode="Markdown",
@@ -306,6 +353,12 @@ def main() -> None:
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .request(HTTPXRequest(
+            read_timeout=60,
+            write_timeout=60,
+            connect_timeout=60,
+            pool_timeout=60,
+        ))
         .build()
     )
 
