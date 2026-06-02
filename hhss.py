@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = "8651176548:AAF0nHOk0HYSFcvkgToocRfVviPIRsaSXzE"
-BOT_USERNAME = nft12bot
+BOT_USERNAME = "nft12bot"
 
 class EmojiStickerBot:
     def __init__(self):
